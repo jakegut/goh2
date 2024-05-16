@@ -3,7 +3,6 @@ package http2
 import (
 	"bufio"
 	"encoding/base64"
-	"encoding/hex"
 	"fmt"
 	"log"
 	"net"
@@ -105,8 +104,6 @@ func (c *Connection) handleHandshake() error {
 
 	c.settings.DecodePayload(settingsPayload)
 
-	fmt.Println(hex.Dump(settingsPayload))
-
 	fmt.Printf("%+v\n", c.settings)
 
 	resp := http11.HTTP11Request{
@@ -157,6 +154,8 @@ func (c *Connection) handleH2() error {
 			}
 			fr.Headers = headers
 
+			log.Printf("creating new stream for %d", fr.Header().StreamID)
+
 			c.newStream(int(fr.Header().StreamID))
 
 		case *SettingsFrame:
@@ -191,7 +190,6 @@ func (c *Connection) handleOutgoingFrames() {
 		if headerFrame, ok := frame.(*HeadersFrame); ok {
 			fmt.Printf("headers: %+v\n", headerFrame.Headers)
 			payload, _ := c.hpackEncoder.Encode(headerFrame.Headers)
-			fmt.Print(hex.Dump(payload))
 			headerFrame.BlockFragment = payload
 			frame = headerFrame
 		}

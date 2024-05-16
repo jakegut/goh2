@@ -37,7 +37,6 @@ Hello, localhost:8080, method: GET
 
 ## TODO
 
-- [ ] Support `POST` requests (decoding Data frames)
 - [ ] Better HTTP/1.1 Upgrade support (currently does handshake, but doesn't create `0x1` stream)
 - [ ] Error handling
 - [ ] Support flow control

@@ -132,7 +132,7 @@ func (i *indexTable) Add(header Header) {
 
 func (i *indexTable) reduce() {
 	for i.currentSize > i.maxSize {
-		header := i.dynamicTable[len(i.dynamicTable)]
+		header := i.dynamicTable[len(i.dynamicTable)-1]
 		i.dynamicTable = i.dynamicTable[:len(i.dynamicTable)-1]
 		i.currentSize -= header.Size()
 	}

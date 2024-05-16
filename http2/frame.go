@@ -59,7 +59,7 @@ func parseHeader(r io.Reader) (FrameHeader, error) {
 	bs := make([]byte, 9)
 	_, err := r.Read(bs)
 	if err != nil {
-		return FrameHeader{}, nil
+		return FrameHeader{}, err
 	}
 
 	return FrameHeader{
@@ -93,15 +93,24 @@ func ParseFrame(r io.Reader) (Frame, error) {
 		return nil, err
 	}
 
-	frame.Payload = make([]byte, frame.Header.Length)
-	_, err = r.Read(frame.Payload)
-	if err != nil {
-		return nil, err
+	frame.Payload = make([]byte, 0)
+	for len(frame.Payload) < int(frame.Header.Length) {
+		rst := int(frame.Header.Length) - len(frame.Payload)
+		buf := make([]byte, rst)
+		n, err := r.Read(buf)
+		if err != nil {
+			return nil, err
+		}
+		frame.Payload = append(frame.Payload, buf[:n]...)
 	}
 
-	fmt.Printf("%+v\n", frame.Header)
+	fmt.Printf("parsing %+v (read %d bytes)\n", frame.Header, len(frame.Payload))
 
 	switch frame.Header.Type {
+	case FrameData:
+		f := &DataFrame{Framed: frame}
+		f.Decode()
+		return f, nil
 	case FrameHeaders:
 		f := &HeadersFrame{Framed: frame}
 		f.Decode()

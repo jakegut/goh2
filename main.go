@@ -1,7 +1,10 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -47,7 +50,19 @@ func main() {
 		c := &http2.Connection{
 			Conn: conn,
 			Handler: func(w http.ResponseWriter, r http2.Request) {
-				fmt.Fprintf(w, "Hello, %v, method: %v", r.Authority, r.Method)
+				fmt.Fprintf(w, "Hello, %v, method: %v\n", r.Authority, r.Method)
+
+				bs, err := io.ReadAll(r.Body)
+				if err != nil {
+					log.Printf("error reading body: %s", err)
+				}
+
+				if len(bs) > 0 {
+					fmt.Print(hex.Dump(bs[:4096]))
+					fmt.Fprintf(w, "received data %d bytes long\n", len(bs))
+					sum := sha256.Sum256(bs)
+					fmt.Fprintf(w, "%x\n", sum)
+				}
 			}}
 		go c.Handle()
 	}

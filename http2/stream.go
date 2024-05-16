@@ -91,7 +91,7 @@ type Stream struct {
 	// if true, next processed frames must be a continuation frame
 	expectingContinuation bool
 
-	reqbuf *bytes.Buffer
+	reqbuf *StreamReader
 	resbuf *StreamWriter
 
 	handler     HandlerFunc
@@ -104,14 +104,13 @@ type Stream struct {
 
 func NewStream(id uint32, outgoing chan<- Frame, handler HandlerFunc) chan Frame {
 	incomingQueue := make(chan Frame)
-	var bf bytes.Buffer
 	s := &Stream{
 		state:         StreamStateIdle,
 		id:            id,
 		reqHeaders:    map[string]hpack.Header{},
 		incomingQueue: incomingQueue,
 		outgoingQueue: outgoing,
-		reqbuf:        &bf,
+		reqbuf:        NewStreamReader(),
 		handler:       handler,
 		log: func(msg string, args ...interface{}) {
 			msg = fmt.Sprintf("[stream %02d]\t", id) + msg
@@ -125,7 +124,7 @@ func NewStream(id uint32, outgoing chan<- Frame, handler HandlerFunc) chan Frame
 }
 
 func (s *Stream) handleFrames() {
-	s.log("starting to listen to events")
+	s.log("starting")
 	for {
 		select {
 		case frame := <-s.incomingQueue:
@@ -136,6 +135,7 @@ func (s *Stream) handleFrames() {
 				if !s.expectingContinuation {
 					s.handlerDoer.Do(s.goHandle)
 				}
+				s.handleOpen(frame)
 			case StreamStateClosed:
 				s.log("closing stream")
 				return
@@ -190,9 +190,62 @@ func (s *Stream) handleIdle(frame Frame) {
 		if !s.expectingContinuation {
 			s.handlerDoer.Do(s.goHandle)
 		}
+		if fr.EndStream {
+			s.reqbuf.EOF()
+		}
 	default:
 		s.log("unhandled frame in idle state")
 	}
+}
+
+func (s *Stream) handleOpen(frame Frame) {
+	switch fr := frame.(type) {
+	case *DataFrame:
+		s.reqbuf.Write(fr.Data)
+		if fr.EndStream {
+			s.reqbuf.EOF()
+		}
+	default:
+		s.log("unhandled frame in open state")
+	}
+}
+
+var _ io.ReadWriter = (*StreamReader)(nil)
+
+type StreamReader struct {
+	rbuf *bytes.Buffer
+
+	mu sync.Mutex
+
+	eof bool
+}
+
+func NewStreamReader() *StreamReader {
+	return &StreamReader{
+		rbuf: bytes.NewBuffer(nil),
+	}
+}
+
+func (s *StreamReader) Read(bs []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, _ := s.rbuf.Read(bs)
+	if s.eof && s.rbuf.Len() == 0 {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (s *StreamReader) Write(bs []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rbuf.Write(bs)
+}
+
+func (s *StreamReader) EOF() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.eof = true
 }
 
 var _ http.ResponseWriter = (*StreamWriter)(nil)
@@ -232,7 +285,7 @@ func (s *StreamWriter) Write(bs []byte) (int, error) {
 		return n, io.ErrClosedPipe
 	}
 
-	if s.wbuf.Len() > 4096 {
+	for s.wbuf.Len() > 4096 {
 		s.sendData(false)
 	}
 

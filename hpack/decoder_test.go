@@ -27,6 +27,25 @@ func TestDecoder(t *testing.T) {
 			},
 			expectErr: false,
 		},
+		{
+			inhex: "0f0d8469f0b2ef",
+			out: []Header{
+				{Name: "content-length", Value: "49137"},
+			},
+		},
+		{
+			inhex: "8386418aa0e41d139d09b8f01e07847a8825b650c3cbbab87f53032a2f2a0f0d8469f0b2ef5f981d75d0620d263d4c795bc78f0b4a7b295adb282d443c8593",
+			out: []Header{
+				{Name: ":method", Value: "POST"},
+				{Name: ":scheme", Value: "http"},
+				{Name: ":authority", Value: "localhost:8080"},
+				{Name: ":path", Value: "/"},
+				{Name: "user-agent", Value: "curl/8.7.1"},
+				{Name: "accept", Value: "*/*"},
+				{Name: "content-length", Value: "49137"},
+				{Name: "content-type", Value: "application/x-www-form-urlencoded"},
+			},
+		},
 	}
 
 	for _, tt := range tests {

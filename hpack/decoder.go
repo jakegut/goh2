@@ -13,15 +13,15 @@ func Decoder() *HPackDecoder {
 func decInt(bs *[]byte, prefix int) int {
 	mask := (1 << prefix) - 1
 	i := int((*bs)[0]) & mask
+	*bs = (*bs)[1:]
 	if i < mask {
-		*bs = (*bs)[1:]
 		return i
 	}
 
 	m := 0
 	for {
-		*bs = (*bs)[1:]
 		oct := (*bs)[0]
+		*bs = (*bs)[1:]
 		i += int(oct&127) << m
 		m += 7
 		if oct&128 != 128 {
@@ -99,7 +99,6 @@ func (h *HPackDecoder) Decode(bs []byte) ([]Header, error) {
 			if err != nil {
 				return nil, err
 			}
-
 			headers = append(headers, header)
 		} else if incrementedIndexed {
 			header, err := h.readHeaderFieldInternal(&bs, decInt(&bs, 6))
@@ -117,7 +116,8 @@ func (h *HPackDecoder) Decode(bs []byte) ([]Header, error) {
 			headers = append(headers, header)
 		} else if sizeUpdate {
 			// TODO: update dynamic table size
-			func() {}()
+			i := decInt(&bs, 5)
+			h.indexTable.UpdateMaxSize(i)
 		}
 	}
 	return headers, nil
