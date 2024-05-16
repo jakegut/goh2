@@ -2,7 +2,6 @@ package main
 
 import (
 	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -58,7 +57,6 @@ func main() {
 				}
 
 				if len(bs) > 0 {
-					fmt.Print(hex.Dump(bs[:4096]))
 					fmt.Fprintf(w, "received data %d bytes long\n", len(bs))
 					sum := sha256.Sum256(bs)
 					fmt.Fprintf(w, "%x\n", sum)

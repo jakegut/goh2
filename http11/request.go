@@ -4,8 +4,24 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"io"
+	"strconv"
 	"strings"
+
+	"github.com/jakegut/goh2/hpack"
 )
+
+var validMethods = map[string]bool{
+	"GET":     true,
+	"HEAD":    true,
+	"POST":    true,
+	"PUT":     true,
+	"DELETE":  true,
+	"CONNECT": true,
+	"OPTIONS": true,
+	"TRACE":   true,
+	"PATH":    true,
+}
 
 type HTTP11Request struct {
 	Method   string
@@ -13,6 +29,8 @@ type HTTP11Request struct {
 	Protocol string
 
 	Headers map[string]string
+
+	Body []byte
 }
 
 type h1ParsingState int
@@ -69,7 +87,7 @@ func (h1 *HTTP11Request) UnmarshalReader(reader *bufio.Reader) error {
 			h1.Path = parts[1]
 			h1.Protocol = parts[2]
 
-			if h1.Method == "GET" {
+			if validMethods[h1.Method] {
 				state = headers
 			} else if h1.Method == "PRI" {
 				reader.Read(make([]byte, 8))
@@ -97,10 +115,38 @@ func (h1 *HTTP11Request) UnmarshalReader(reader *bufio.Reader) error {
 				h1.Headers[strings.ToLower(parts[0])] = parts[1]
 			}
 		case body:
-			if h1.Method == "GET" {
+			contentLengthStr, ok := h1.Headers["content-length"]
+			if !ok {
 				state = end
+				break
 			}
+			contentLength, err := strconv.Atoi(contentLengthStr)
+			if err != nil {
+				return err
+			}
+
+			h1.Body = make([]byte, contentLength)
+
+			_, err = io.ReadFull(reader, h1.Body)
+			if err != nil {
+				return err
+			}
+			state = end
 		}
 	}
 	return nil
+}
+
+func (h1 *HTTP11Request) H2Headers() []hpack.Header {
+	headers := []hpack.Header{
+		hpack.NewHeader(":method", h1.Method),
+		hpack.NewHeader(":path", h1.Path),
+		hpack.NewHeader(":authority", h1.Headers["host"]),
+	}
+
+	for name, value := range h1.Headers {
+		headers = append(headers, hpack.NewHeader(name, value))
+	}
+
+	return headers
 }

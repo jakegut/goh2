@@ -86,8 +86,6 @@ func (c *Connection) handleHandshake() error {
 		return nil
 	}
 
-	fmt.Printf("%+v\n", h1)
-
 	if h1.Headers["upgrade"] != "h2c" {
 		return fmt.Errorf("expected 'h2c' in upgrade, got: %q", h1.Headers["upgrade"])
 	}
@@ -103,8 +101,6 @@ func (c *Connection) handleHandshake() error {
 	}
 
 	c.settings.DecodePayload(settingsPayload)
-
-	fmt.Printf("%+v\n", c.settings)
 
 	resp := http11.HTTP11Request{
 		Method:   "HTTP/1.1",
@@ -134,6 +130,47 @@ func (c *Connection) handleHandshake() error {
 	// discard magic string (client preface)
 
 	c.bufreader.Read(make([]byte, 24))
+
+	c.newStream(1)
+
+	initHeaders := &HeadersFrame{
+		Framed: Framed{
+			Header: FrameHeader{
+				StreamID: 1,
+			},
+		},
+		EndStream:  h1.Body == nil,
+		EndHeaders: true,
+		Headers:    h1.H2Headers(),
+	}
+
+	c.streamHandlers[1] <- initHeaders
+
+	if h1.Body != nil {
+		maxLen := int(c.settings.MaxFrameSize)
+
+		bs := h1.Body
+		for len(bs) > 0 {
+			mx := maxLen
+			if len(bs) < mx {
+				mx = len(bs)
+			}
+
+			df := &DataFrame{
+				Framed: Framed{
+					Header: FrameHeader{
+						StreamID: 1,
+					},
+				},
+				EndStream: mx < maxLen,
+				Data:      bs[:mx],
+			}
+
+			c.streamHandlers[1] <- df
+
+			bs = bs[mx:]
+		}
+	}
 
 	return nil
 }
@@ -168,12 +205,7 @@ func (c *Connection) handleH2() error {
 					Ack: true,
 				}
 
-				bs, err := set.Encode()
-				if err != nil {
-					return err
-				}
-
-				c.Write(bs)
+				c.outgoingFrames <- set
 			}
 		case *WindowUpdateFrame:
 			fmt.Println("HANDLE WINDOW UPDATE WHOOOPS")

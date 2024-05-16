@@ -181,7 +181,6 @@ func (s *Stream) goHandle() {
 func (s *Stream) handleIdle(frame Frame) {
 	switch fr := frame.(type) {
 	case *HeadersFrame:
-		s.log("handling headers in idle state")
 		for _, header := range fr.Headers {
 			s.reqHeaders[header.Name] = header
 		}
@@ -316,7 +315,6 @@ func (s *StreamWriter) readAll() ([]byte, error) {
 }
 
 func (s *StreamWriter) setDefaultHeaders() {
-	s.headers.Set(":status", fmt.Sprintf("%d", s.statusCode))
 	if str := s.headers.Get("content-type"); str == "" {
 		s.headers.Set("content-type", "text/plain; charset=utf-8")
 	}
@@ -328,7 +326,7 @@ func (s *StreamWriter) setDefaultHeaders() {
 func (s *StreamWriter) sendData(closing bool) {
 	if !s.sentHeaders {
 		s.setDefaultHeaders()
-		headers := []hpack.Header{}
+		headers := []hpack.Header{hpack.NewHeader(":status", fmt.Sprintf("%d", s.statusCode))}
 		for name, val := range s.headers {
 			headers = append(headers, hpack.Header{
 				Name:  strings.ToLower(name),

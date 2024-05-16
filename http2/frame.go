@@ -93,15 +93,18 @@ func ParseFrame(r io.Reader) (Frame, error) {
 		return nil, err
 	}
 
-	frame.Payload = make([]byte, 0)
-	for len(frame.Payload) < int(frame.Header.Length) {
-		rst := int(frame.Header.Length) - len(frame.Payload)
-		buf := make([]byte, rst)
-		n, err := r.Read(buf)
-		if err != nil {
-			return nil, err
-		}
-		frame.Payload = append(frame.Payload, buf[:n]...)
+	frame.Payload = make([]byte, frame.Header.Length)
+	// for len(frame.Payload) < int(frame.Header.Length) {
+	// 	rst := int(frame.Header.Length) - len(frame.Payload)
+	// 	buf := make([]byte, rst)
+	// 	n, err := r.Read(buf)
+	// 	if err != nil {
+	// 		return nil, err
+	// 	}
+	// 	frame.Payload = append(frame.Payload, buf[:n]...)
+	// }
+	if _, err := io.ReadFull(r, frame.Payload); err != nil {
+		return nil, err
 	}
 
 	fmt.Printf("parsing %+v (read %d bytes)\n", frame.Header, len(frame.Payload))
