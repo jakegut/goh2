@@ -19,9 +19,11 @@ for {
         log.Fatal(err)
     }
     log.Printf("accepted from %s", conn.RemoteAddr().String())
-    c := &http2.Connection{Conn: conn, Handler: func(w http.ResponseWriter, r http2.Request) {
-        fmt.Fprintf(w, "Hello, %v, method: %v", r.Authority, r.Method)
-    }}
+    c := &http2.Connection{
+        Conn: conn,
+        Handler: func(w http.ResponseWriter, r http2.Request) {
+            fmt.Fprintf(w, "Hello, %v, method: %v", r.Authority, r.Method)
+        }}
     go c.Handle()
 }
 ```
