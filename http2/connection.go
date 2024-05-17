@@ -38,7 +38,12 @@ type Connection struct {
 }
 
 func (c *Connection) Handle() {
-	defer c.Close()
+	defer func() {
+		log.Printf("closing connection")
+		if err := c.Close(); err != nil {
+			log.Printf("error closing connection: %s", err)
+		}
+	}()
 	c.bufreader = bufio.NewReader(c)
 	c.streamHandlers = map[int]chan Frame{}
 	c.hpackDecoder = hpack.Decoder()
@@ -178,8 +183,8 @@ func (c *Connection) handleHandshake() error {
 func (c *Connection) handleH2() error {
 	go c.handleOutgoingFrames()
 	for {
-		frame, err := ParseFrame(c.bufreader)
-		if err != nil {
+		frame, err := ParseFrame(c.bufreader, c.settings.MaxFrameSize)
+		if err != nil && err != ErrUnknownFrame {
 			return err
 		}
 
@@ -207,8 +212,18 @@ func (c *Connection) handleH2() error {
 
 				c.outgoingFrames <- set
 			}
+		case *PingFrame:
+			if !fr.Ack {
+				fr.Ack = true
+
+				// TODO: handle length != 8
+
+				c.outgoingFrames <- fr
+			}
 		case *WindowUpdateFrame:
 			fmt.Println("HANDLE WINDOW UPDATE WHOOOPS")
+		case nil:
+			continue
 		}
 
 		if frame.Header().StreamID > 0 {

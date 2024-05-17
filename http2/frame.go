@@ -3,8 +3,10 @@ package http2
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 
 	"github.com/jakegut/goh2/hpack"
 )
@@ -34,6 +36,29 @@ const (
 	HeadersEndHeaders FrameFlag = 0x4
 	HeadersPadded     FrameFlag = 0x8
 	HeadersPriority   FrameFlag = 0x20
+
+	SettingsAck FrameFlag = 0x1
+
+	PingAck FrameFlag = 0x1
+)
+
+type ErrorCode uint8
+
+const (
+	ErrNoError            ErrorCode = 0x0
+	ErrProtocolError      ErrorCode = 0x1
+	ErrInternalError      ErrorCode = 0x2
+	ErrFlowControlError   ErrorCode = 0x3
+	ErrSettingsTimeout    ErrorCode = 0x4
+	ErrStreamClosed       ErrorCode = 0x5
+	ErrFrameSizeError     ErrorCode = 0x6
+	ErrRefusedStream      ErrorCode = 0x7
+	ErrCancel             ErrorCode = 0x8
+	ErrCompressionError   ErrorCode = 0x9
+	ErrConnectError       ErrorCode = 0xa
+	ErrEnhanceYourCalm    ErrorCode = 0xb // this goes hard af
+	ErrInadequateSecurity ErrorCode = 0xc
+	ErrHTTP11Required     ErrorCode = 0xd
 )
 
 /*
@@ -85,12 +110,22 @@ type Framed struct {
 	Payload []byte
 }
 
-func ParseFrame(r io.Reader) (Frame, error) {
+var ErrUnknownFrame = errors.New("frame is UNKNOWN")
+var ErrExceedsMaxFrameSize = errors.New("exceeds MAX_FRAME_SIZE")
+
+func ParseFrame(r io.Reader, maxSize uint32) (Frame, error) {
 	frame := Framed{}
 	var err error
 	frame.Header, err = parseHeader(r)
 	if err != nil {
 		return nil, err
+	}
+
+	switch frame.Header.Type {
+	case FrameHeaders, FrameData:
+		if frame.Header.Length > maxSize {
+			return nil, ErrExceedsMaxFrameSize
+		}
 	}
 
 	frame.Payload = make([]byte, frame.Header.Length)
@@ -124,12 +159,19 @@ func ParseFrame(r io.Reader) (Frame, error) {
 		}
 		f.Decode()
 		return f, nil
+	case FramePing:
+		f := &PingFrame{
+			Framed: frame,
+		}
+		f.Decode()
+		return f, nil
 	case FrameWindowUpdate:
 		f := &WindowUpdateFrame{Framed: frame}
 		f.Decode()
 		return f, nil
 	default:
-		return nil, fmt.Errorf("frame not supported: %d", frame.Header.Type)
+		log.Printf("unknown frame type: %d", frame.Header.Type)
+		return nil, ErrUnknownFrame
 	}
 }
 
@@ -279,6 +321,33 @@ func (h *HeadersFrame) Encode() ([]byte, error) {
 	return EncodeFrame(buf.Bytes(), FrameHeaders, flags, h.Framed.Header.StreamID)
 }
 
+type RSTStreamFrame struct {
+	Framed Framed
+
+	ErrorCode ErrorCode
+}
+
+func (r *RSTStreamFrame) Header() FrameHeader {
+	return r.Framed.Header
+}
+
+func (r *RSTStreamFrame) Decode() {
+	code := binary.BigEndian.Uint32(r.Framed.Payload)
+	if code > uint32(ErrHTTP11Required) {
+		code = uint32(ErrInternalError)
+	}
+	r.ErrorCode = ErrorCode(code)
+}
+
+func (r *RSTStreamFrame) Encode() ([]byte, error) {
+	return EncodeFrame(
+		binary.BigEndian.AppendUint32([]byte{}, uint32(r.ErrorCode)),
+		FrameRSTStream,
+		0,
+		r.Header().StreamID,
+	)
+}
+
 type SettingsFrame struct {
 	Framed Framed
 
@@ -310,7 +379,7 @@ func (s *SettingsFrame) Decode() {
 		bs = bs[6:]
 	}
 
-	s.Ack = s.Framed.Header.Flags&0x1 == 0x1
+	s.Ack = s.Framed.Header.hasFlag(SettingsAck)
 }
 
 func (s *SettingsFrame) Encode() ([]byte, error) {
@@ -328,10 +397,36 @@ func (s *SettingsFrame) Encode() ([]byte, error) {
 
 	var flags uint8
 	if s.Ack {
-		flags = 0x1
+		flags |= uint8(SettingsAck)
 	}
 
 	return EncodeFrame(payload, FrameSettings, flags, 0)
+}
+
+type PingFrame struct {
+	Framed Framed
+
+	Ack bool
+
+	Opaque []byte
+}
+
+func (p *PingFrame) Header() FrameHeader {
+	return p.Framed.Header
+}
+
+func (p *PingFrame) Decode() {
+	p.Opaque = p.Framed.Payload
+}
+
+func (p *PingFrame) Encode() ([]byte, error) {
+
+	var flags uint8
+	if p.Ack {
+		flags |= uint8(PingAck)
+	}
+
+	return EncodeFrame(p.Opaque, FramePing, flags, 0)
 }
 
 type WindowUpdateFrame struct {
