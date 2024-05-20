@@ -2,28 +2,24 @@ package http2
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"log"
 	"net"
+	"sync"
 
 	"github.com/jakegut/goh2/hpack"
 	"github.com/jakegut/goh2/http11"
 )
 
-type ConnectionState int
-
-const (
-	handshake ConnectionState = iota
-	h2
-)
-
 type Connection struct {
 	net.Conn
 
+	maxStreamId uint32
+
 	bufreader *bufio.Reader
 
-	state    ConnectionState
 	settings *ConnectionSettings
 
 	hpackDecoder *hpack.HPackDecoder
@@ -35,36 +31,40 @@ type Connection struct {
 	outgoingFrames chan Frame
 
 	Handler HandlerFunc
+
+	writerWG sync.WaitGroup
 }
 
 func (c *Connection) Handle() {
+	ctx, cancel := context.WithCancel(context.Background())
+
 	defer func() {
 		log.Printf("closing connection")
-		if err := c.Close(); err != nil {
+		close(c.outgoingFrames)
+		cancel()
+		c.writerWG.Wait()
+		if err := c.Conn.Close(); err != nil {
 			log.Printf("error closing connection: %s", err)
 		}
+		log.Printf("connection closed")
 	}()
+
 	c.bufreader = bufio.NewReader(c)
 	c.streamHandlers = map[int]chan Frame{}
 	c.hpackDecoder = hpack.Decoder()
 	c.hpackEncoder = &hpack.HPackEncoder{}
 	c.outgoingFrames = make(chan Frame)
-	defer close(c.outgoingFrames)
-	for {
-		switch c.state {
-		case handshake:
-			if err := c.handleHandshake(); err != nil {
-				log.Printf("handling handshake: %s", err)
-				return
-			}
-			c.state = h2
-		case h2:
-			if err := c.handleH2(); err != nil {
-				log.Printf("handling: %s", err)
-				return
-			}
-			return
-		}
+
+	if err := c.handleHandshake(); err != nil {
+		log.Printf("handling handshake: %s", err)
+		return
+	}
+
+	c.writerWG.Add(1)
+	go c.handleOutgoingFrames(ctx)
+	if err := c.handleH2(); err != nil {
+		log.Printf("handling: %s", err)
+		return
 	}
 }
 
@@ -181,11 +181,19 @@ func (c *Connection) handleHandshake() error {
 }
 
 func (c *Connection) handleH2() error {
-	go c.handleOutgoingFrames()
+
 	for {
 		frame, err := ParseFrame(c.bufreader, c.settings.MaxFrameSize)
-		if err != nil && err != ErrUnknownFrame {
-			return err
+		if err != nil {
+			if err == ErrExceedsMaxFrameSize {
+				c.outgoingFrames <- &GoAwayFrame{
+					LastStreamID: c.maxStreamId,
+					ErrorCode:    ErrFrameSizeError,
+				}
+				return err
+			} else if err != ErrUnknownFrame {
+				return err
+			}
 		}
 
 		switch fr := frame.(type) {
@@ -232,31 +240,43 @@ func (c *Connection) handleH2() error {
 	}
 }
 
-func (c *Connection) handleOutgoingFrames() {
-	for frame := range c.outgoingFrames {
-		if headerFrame, ok := frame.(*HeadersFrame); ok {
-			fmt.Printf("headers: %+v\n", headerFrame.Headers)
-			payload, _ := c.hpackEncoder.Encode(headerFrame.Headers)
-			headerFrame.BlockFragment = payload
-			frame = headerFrame
-		}
+func (c *Connection) handleOutgoingFrames(ctx context.Context) {
+	defer c.writerWG.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case frame := <-c.outgoingFrames:
+			if frame == nil {
+				continue
+			}
+			if headerFrame, ok := frame.(*HeadersFrame); ok {
+				fmt.Printf("headers: %+v\n", headerFrame.Headers)
+				payload, _ := c.hpackEncoder.Encode(headerFrame.Headers)
+				headerFrame.BlockFragment = payload
+				frame = headerFrame
+			}
 
-		fmt.Printf("encoding frame: %T\n", frame)
+			fmt.Printf("encoding frame: %T\n", frame)
 
-		encFrame, err := frame.Encode()
-		if err != nil {
-			log.Printf("error encoding frame: %s", err)
-		}
+			encFrame, err := frame.Encode()
+			if err != nil {
+				log.Printf("error encoding frame: %s", err)
+			}
 
-		n, err := c.Write(encFrame)
-		if err != nil {
-			log.Fatalf("error writing frame: %s", err)
+			n, err := c.Write(encFrame)
+			if err != nil {
+				log.Fatalf("error writing frame: %s", err)
+			}
+			log.Printf("wrote %d bytes", n)
 		}
-		log.Printf("wrote %d bytes", n)
 	}
 }
 
 func (c *Connection) newStream(streamid int) {
+	if c.maxStreamId < uint32(streamid) {
+		c.maxStreamId = uint32(streamid)
+	}
 	if _, ok := c.streamHandlers[streamid]; ok {
 		return
 	}

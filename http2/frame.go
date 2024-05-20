@@ -429,6 +429,39 @@ func (p *PingFrame) Encode() ([]byte, error) {
 	return EncodeFrame(p.Opaque, FramePing, flags, 0)
 }
 
+type GoAwayFrame struct {
+	Framed Framed
+
+	LastStreamID uint32
+	ErrorCode    ErrorCode
+	Opaque       []byte
+}
+
+func (g *GoAwayFrame) Header() FrameHeader {
+	return g.Framed.Header
+}
+
+func (g *GoAwayFrame) Decode() {
+	bs := g.Framed.Payload
+	g.LastStreamID = binary.BigEndian.Uint32(bs) & ((1 << 31) - 1)
+	g.ErrorCode = ErrorCode(binary.BigEndian.Uint32(bs[4:]))
+
+	if len(bs) > 8 {
+		g.Opaque = bs[8:]
+	}
+}
+
+func (g *GoAwayFrame) Encode() ([]byte, error) {
+	payload := binary.BigEndian.AppendUint32([]byte{}, g.LastStreamID)
+	payload = binary.BigEndian.AppendUint32(payload, uint32(g.ErrorCode))
+
+	if g.Opaque != nil {
+		payload = append(payload, g.Opaque...)
+	}
+
+	return EncodeFrame(payload, FrameGoAway, 0, 0)
+}
+
 type WindowUpdateFrame struct {
 	Framed Framed
 

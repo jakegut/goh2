@@ -1,8 +1,12 @@
 package hpack
 
+import "errors"
+
 type HPackDecoder struct {
 	indexTable *indexTable
 }
+
+var ErrCompressionError = errors.New("COMPRESSION_ERROR")
 
 func Decoder() *HPackDecoder {
 	return &HPackDecoder{
@@ -33,8 +37,14 @@ func decInt(bs *[]byte, prefix int) int {
 }
 
 func readStringLiteral(bs *[]byte) (string, error) {
+	if len(*bs) == 0 {
+		return "", ErrCompressionError
+	}
 	huffman := (*bs)[0]&0x80 != 0 // huffman
 	n := decInt(bs, 7)
+	if len(*bs) < n {
+		return "", ErrCompressionError
+	}
 	dec := (*bs)[:n]
 	var str string
 	var err error
