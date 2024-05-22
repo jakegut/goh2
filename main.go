@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"time"
 
 	"github.com/jakegut/goh2/http2"
 	gohttp2 "golang.org/x/net/http2"
@@ -49,18 +50,29 @@ func main() {
 		c := &http2.Connection{
 			Conn: conn,
 			Handler: func(w http.ResponseWriter, r http2.Request) {
+				time.Sleep(time.Second)
 				fmt.Fprintf(w, "Hello, %v, method: %v\n", r.Authority, r.Method)
 
-				bs, err := io.ReadAll(r.Body)
-				if err != nil {
-					log.Printf("error reading body: %s", err)
+				if r.Method == "POST" {
+					hash := sha256.New()
+					if _, err := io.Copy(hash, r.Body); err != nil {
+						log.Fatal(err)
+					}
+					sum := hash.Sum(nil)
+					fmt.Fprintf(w, "1 sum: %x\n", sum)
+
 				}
 
-				if len(bs) > 0 {
-					fmt.Fprintf(w, "received data %d bytes long\n", len(bs))
-					sum := sha256.Sum256(bs)
-					fmt.Fprintf(w, "%x\n", sum)
-				}
+				// bs, err := io.ReadAll(r.Body)
+				// if err != nil {
+				// 	log.Printf("error reading body: %s", err)
+				// }
+
+				// if len(bs) > 0 {
+				// 	fmt.Fprintf(w, "received data %d bytes long\n", len(bs))
+				// 	sum := sha256.Sum256(bs)
+				// 	fmt.Fprintf(w, "2 sum: %x\n", sum)
+				// }
 			}}
 		go c.Handle()
 	}

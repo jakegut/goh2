@@ -40,6 +40,8 @@ const (
 	SettingsAck FrameFlag = 0x1
 
 	PingAck FrameFlag = 0x1
+
+	ContinuationEndHeaders FrameFlag = 0x4
 )
 
 type ErrorCode uint8
@@ -105,6 +107,21 @@ type Frame interface {
 	Encode() ([]byte, error)
 }
 
+type frameParserFunc func(Framed) Frame
+
+var frameParsers = map[FrameType]frameParserFunc{
+	FrameData:    dataFrame,
+	FrameHeaders: headersFrame,
+	// FramePriority:
+	FrameRSTStream: rstStreamFrame,
+	FrameSettings:  settingsFrame,
+	// FramePushPromise
+	FramePing:         pingFrame,
+	FrameGoAway:       goAwayFrame,
+	FrameWindowUpdate: windowUpdateFrame,
+	FrameContinuation: continuationFrame,
+}
+
 type Framed struct {
 	Header  FrameHeader
 	Payload []byte
@@ -112,6 +129,8 @@ type Framed struct {
 
 var ErrUnknownFrame = errors.New("frame is UNKNOWN")
 var ErrExceedsMaxFrameSize = errors.New("exceeds MAX_FRAME_SIZE")
+var ErrConnProtocolError = errors.New("PROTOCOL_ERROR")
+var ErrConnStreamError = errors.New("STREAM_ERROR")
 
 func ParseFrame(r io.Reader, maxSize uint32) (Frame, error) {
 	frame := Framed{}
@@ -129,47 +148,18 @@ func ParseFrame(r io.Reader, maxSize uint32) (Frame, error) {
 	}
 
 	frame.Payload = make([]byte, frame.Header.Length)
-	// for len(frame.Payload) < int(frame.Header.Length) {
-	// 	rst := int(frame.Header.Length) - len(frame.Payload)
-	// 	buf := make([]byte, rst)
-	// 	n, err := r.Read(buf)
-	// 	if err != nil {
-	// 		return nil, err
-	// 	}
-	// 	frame.Payload = append(frame.Payload, buf[:n]...)
-	// }
 	if _, err := io.ReadFull(r, frame.Payload); err != nil {
 		return nil, err
 	}
 
 	fmt.Printf("parsing %+v (read %d bytes)\n", frame.Header, len(frame.Payload))
 
-	switch frame.Header.Type {
-	case FrameData:
-		f := &DataFrame{Framed: frame}
+	if parserFn, ok := frameParsers[frame.Header.Type]; ok {
+		f := parserFn(frame)
+		log.Printf("decoding frame: %T", f)
 		f.Decode()
 		return f, nil
-	case FrameHeaders:
-		f := &HeadersFrame{Framed: frame}
-		f.Decode()
-		return f, nil
-	case FrameSettings:
-		f := &SettingsFrame{
-			Framed: frame,
-		}
-		f.Decode()
-		return f, nil
-	case FramePing:
-		f := &PingFrame{
-			Framed: frame,
-		}
-		f.Decode()
-		return f, nil
-	case FrameWindowUpdate:
-		f := &WindowUpdateFrame{Framed: frame}
-		f.Decode()
-		return f, nil
-	default:
+	} else {
 		log.Printf("unknown frame type: %d", frame.Header.Type)
 		return nil, ErrUnknownFrame
 	}
@@ -203,6 +193,10 @@ type DataFrame struct {
 
 	PadLength uint8
 	Data      []byte
+}
+
+func dataFrame(framed Framed) Frame {
+	return &DataFrame{Framed: framed}
 }
 
 func (d *DataFrame) Header() FrameHeader {
@@ -249,6 +243,10 @@ type HeadersFrame struct {
 
 	// Headers to be filled out by the connection handler, not used by Decode and Encode methods
 	Headers []hpack.Header
+}
+
+func headersFrame(framed Framed) Frame {
+	return &HeadersFrame{Framed: framed}
 }
 
 func (h *HeadersFrame) Header() FrameHeader {
@@ -327,6 +325,10 @@ type RSTStreamFrame struct {
 	ErrorCode ErrorCode
 }
 
+func rstStreamFrame(framed Framed) Frame {
+	return &RSTStreamFrame{Framed: framed}
+}
+
 func (r *RSTStreamFrame) Header() FrameHeader {
 	return r.Framed.Header
 }
@@ -353,6 +355,10 @@ type SettingsFrame struct {
 
 	Ack  bool
 	Args []SettingFrameArgs
+}
+
+func settingsFrame(framed Framed) Frame {
+	return &SettingsFrame{Framed: framed}
 }
 
 type SettingFrameArgs struct {
@@ -411,6 +417,10 @@ type PingFrame struct {
 	Opaque []byte
 }
 
+func pingFrame(framed Framed) Frame {
+	return &PingFrame{Framed: framed}
+}
+
 func (p *PingFrame) Header() FrameHeader {
 	return p.Framed.Header
 }
@@ -435,6 +445,10 @@ type GoAwayFrame struct {
 	LastStreamID uint32
 	ErrorCode    ErrorCode
 	Opaque       []byte
+}
+
+func goAwayFrame(framed Framed) Frame {
+	return &GoAwayFrame{Framed: framed}
 }
 
 func (g *GoAwayFrame) Header() FrameHeader {
@@ -468,6 +482,10 @@ type WindowUpdateFrame struct {
 	SizeIncrement uint32
 }
 
+func windowUpdateFrame(framed Framed) Frame {
+	return &WindowUpdateFrame{Framed: framed}
+}
+
 func (w *WindowUpdateFrame) Header() FrameHeader {
 	return w.Framed.Header
 }
@@ -480,4 +498,38 @@ func (w *WindowUpdateFrame) Encode() ([]byte, error) {
 	payload := binary.BigEndian.AppendUint32([]byte{}, w.SizeIncrement)
 
 	return EncodeFrame(payload, FrameWindowUpdate, 0, 0)
+}
+
+type ContinuationFrame struct {
+	Framed Framed
+
+	EndHeaders bool
+
+	BlockFragment []byte
+
+	// not used directly by Encode/Decode
+	Headers []hpack.Header
+}
+
+func continuationFrame(framed Framed) Frame {
+	return &ContinuationFrame{Framed: framed}
+}
+
+func (c *ContinuationFrame) Header() FrameHeader {
+	return c.Framed.Header
+}
+
+func (c *ContinuationFrame) Decode() {
+	c.EndHeaders = c.Framed.Header.hasFlag(ContinuationEndHeaders)
+
+	c.BlockFragment = c.Framed.Payload
+}
+
+func (c *ContinuationFrame) Encode() ([]byte, error) {
+	var flags uint8
+	if c.EndHeaders {
+		flags |= uint8(ContinuationEndHeaders)
+	}
+
+	return EncodeFrame(c.BlockFragment, FrameContinuation, flags, c.Framed.Header.StreamID)
 }

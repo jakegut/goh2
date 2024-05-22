@@ -86,10 +86,7 @@ type Stream struct {
 	reqHeaders map[string]hpack.Header
 
 	incomingQueue <-chan Frame
-	outgoingQueue chan<- Frame
-
-	// if true, next processed frames must be a continuation frame
-	expectingContinuation bool
+	outgoingQueue chan<- StreamEvent
 
 	reqbuf *StreamReader
 	resbuf *StreamWriter
@@ -98,11 +95,30 @@ type Stream struct {
 	handlerDone chan struct{}
 
 	handlerDoer sync.Once
+	handlerWg   sync.WaitGroup
 
 	log func(msg string, args ...interface{})
 }
 
-func NewStream(id uint32, outgoing chan<- Frame, handler HandlerFunc) chan Frame {
+type StreamEvent interface {
+	streamID() uint32
+}
+
+type StreamTransitionEvent struct {
+	ToState  StreamState
+	StreamID uint32
+}
+
+func (s StreamTransitionEvent) streamID() uint32 { return s.StreamID }
+
+type StreamOutgoingFrameEvent struct {
+	Frame    Frame
+	StreamID uint32
+}
+
+func (s StreamOutgoingFrameEvent) streamID() uint32 { return s.StreamID }
+
+func NewStream(id uint32, outgoing chan<- StreamEvent, handler HandlerFunc, wg *sync.WaitGroup) chan Frame {
 	incomingQueue := make(chan Frame)
 	s := &Stream{
 		state:         StreamStateIdle,
@@ -116,46 +132,54 @@ func NewStream(id uint32, outgoing chan<- Frame, handler HandlerFunc) chan Frame
 			msg = fmt.Sprintf("[stream %02d]\t", id) + msg
 			log.Printf(msg, args...)
 		},
+		handlerDone: make(chan struct{}),
 	}
 
-	go s.handleFrames()
+	wg.Add(1)
+	go func() {
+		s.handleFrames()
+		s.handlerWg.Wait()
+		wg.Done()
+	}()
 
 	return incomingQueue
 }
 
 func (s *Stream) handleFrames() {
 	s.log("starting")
-	for {
+	for s.state != StreamStateClosed {
 		select {
 		case frame := <-s.incomingQueue:
+			if _, ok := frame.(*RSTStreamFrame); ok {
+				s.transition(StreamStateClosed)
+				continue
+			}
+			s.log("handling %T in %s", frame, string(s.state))
 			switch s.state {
 			case StreamStateIdle:
 				s.handleIdle(frame)
 			case StreamStateOpen:
-				if !s.expectingContinuation {
-					s.handlerDoer.Do(s.goHandle)
-				}
+				s.handlerDoer.Do(s.goHandle)
 				s.handleOpen(frame)
-			case StreamStateClosed:
-				s.log("closing stream")
-				return
+			case StreamStateHalfClosedRemote:
+				s.handleHalfClosedRemote(frame)
 			default:
 				s.log("unhanded state: %q", string(s.state))
 			}
-
 		case <-s.handlerDone:
 			s.log("statuscode: %d", s.resbuf.statusCode)
 			s.resbuf.sendData(true)
-			s.state = StreamStateClosed
+			s.transition(StreamStateClosed)
 		}
 	}
+	s.log("closing stream")
 }
 
 func (s *Stream) goHandle() {
-	s.handlerDone = make(chan struct{})
-	req := Request{}
-	headers := map[string]string{}
-	s.resbuf = NewStreamWriter(s.id, s.outgoingQueue)
+	s.log("go handle")
+	req := Request{Headers: make(map[string]string)}
+	s.resbuf = NewStreamWriter(s.id, s.writeFrame)
+	s.handlerWg.Add(1)
 	for _, header := range s.reqHeaders {
 		switch header.Name {
 		case ":method":
@@ -165,7 +189,7 @@ func (s *Stream) goHandle() {
 		case ":authority":
 			req.Authority = header.Value
 		default:
-			headers[header.Name] = header.Value
+			req.Headers[header.Name] = header.Value
 		}
 	}
 
@@ -175,22 +199,23 @@ func (s *Stream) goHandle() {
 		s.log("firing off handler")
 		s.handler(s.resbuf, req)
 		s.handlerDone <- struct{}{}
+		s.handlerWg.Done()
 	}()
 }
 
 func (s *Stream) handleIdle(frame Frame) {
 	switch fr := frame.(type) {
 	case *HeadersFrame:
+		s.log("headers in idle")
 		for _, header := range fr.Headers {
+			s.log("[%s: %s]", header.Name, header.Value)
 			s.reqHeaders[header.Name] = header
 		}
-		s.expectingContinuation = !fr.EndHeaders
-		s.state = StreamStateOpen
-		if !s.expectingContinuation {
-			s.handlerDoer.Do(s.goHandle)
-		}
+		s.transition(StreamStateOpen)
+		s.handlerDoer.Do(s.goHandle)
 		if fr.EndStream {
 			s.reqbuf.EOF()
+			s.transition(StreamStateHalfClosedRemote)
 		}
 	default:
 		s.log("unhandled frame in idle state")
@@ -203,10 +228,47 @@ func (s *Stream) handleOpen(frame Frame) {
 		s.reqbuf.Write(fr.Data)
 		if fr.EndStream {
 			s.reqbuf.EOF()
+			s.transition(StreamStateHalfClosedRemote)
 		}
 	default:
 		s.log("unhandled frame in open state")
 	}
+}
+
+func (s *Stream) handleHalfClosedRemote(frame Frame) {
+	switch frame.(type) {
+	default:
+		s.streamClosedErr()
+	}
+}
+
+func (s *Stream) streamClosedErr() {
+	s.writeFrame(&RSTStreamFrame{
+		Framed: Framed{
+			Header: FrameHeader{
+				StreamID: s.id,
+			},
+		},
+		ErrorCode: ErrStreamClosed,
+	})
+	s.transition(StreamStateClosed)
+}
+
+func (s *Stream) writeFrame(frame Frame) {
+	s.outgoingQueue <- StreamOutgoingFrameEvent{
+		Frame:    frame,
+		StreamID: s.id,
+	}
+}
+
+func (s *Stream) transition(to StreamState) {
+	s.log("transitioning to %s", string(to))
+	s.state = to
+	s.outgoingQueue <- StreamTransitionEvent{
+		ToState:  to,
+		StreamID: s.id,
+	}
+	s.log("transitioned to %s", string(to))
 }
 
 var _ io.ReadWriter = (*StreamReader)(nil)
@@ -256,21 +318,21 @@ type StreamWriter struct {
 
 	sentHeaders bool
 
-	outgoing chan<- Frame
+	frameWriter func(Frame)
 
 	wbuf *bytes.Buffer
 
 	closed bool
 }
 
-func NewStreamWriter(streamid uint32, outgoing chan<- Frame) *StreamWriter {
+func NewStreamWriter(streamid uint32, frameWriter func(Frame)) *StreamWriter {
 	return &StreamWriter{
-		headers:    map[string][]string{},
-		statusCode: 200,
-		closed:     false,
-		wbuf:       bytes.NewBuffer(nil),
-		outgoing:   outgoing,
-		streamId:   streamid,
+		headers:     map[string][]string{},
+		statusCode:  200,
+		closed:      false,
+		wbuf:        bytes.NewBuffer(nil),
+		frameWriter: frameWriter,
+		streamId:    streamid,
 	}
 }
 
@@ -297,21 +359,6 @@ func (s *StreamWriter) WriteHeader(statusCode int) {
 
 func (s *StreamWriter) read(bs []byte) (int, error) {
 	return s.wbuf.Read(bs)
-}
-
-func (s *StreamWriter) readAll() ([]byte, error) {
-	res := make([]byte, 0)
-
-	temp := make([]byte, 1024)
-	for {
-		n, err := s.wbuf.Read(temp)
-		res = append(res, temp[:n]...)
-		if n < 1024 || (err != nil && err == io.EOF) {
-			break
-		}
-	}
-
-	return res, nil
 }
 
 func (s *StreamWriter) setDefaultHeaders() {
@@ -343,7 +390,7 @@ func (s *StreamWriter) sendData(closing bool) {
 			EndHeaders: true,
 			Headers:    headers,
 		}
-		s.outgoing <- &headerFrame
+		s.frameWriter(&headerFrame)
 		s.sentHeaders = true
 	}
 
@@ -361,5 +408,5 @@ func (s *StreamWriter) sendData(closing bool) {
 		EndStream: closing,
 	}
 
-	s.outgoing <- &dataFrame
+	s.frameWriter(&dataFrame)
 }

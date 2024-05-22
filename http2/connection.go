@@ -27,8 +27,9 @@ type Connection struct {
 
 	windowSize uint32
 
-	streamHandlers map[int]chan Frame
-	outgoingFrames chan Frame
+	streamMu       sync.Mutex
+	streamHandlers map[uint32]chan Frame
+	streamEvents   chan StreamEvent
 
 	Handler HandlerFunc
 
@@ -40,9 +41,9 @@ func (c *Connection) Handle() {
 
 	defer func() {
 		log.Printf("closing connection")
-		close(c.outgoingFrames)
 		cancel()
 		c.writerWG.Wait()
+		close(c.streamEvents)
 		if err := c.Conn.Close(); err != nil {
 			log.Printf("error closing connection: %s", err)
 		}
@@ -50,10 +51,10 @@ func (c *Connection) Handle() {
 	}()
 
 	c.bufreader = bufio.NewReader(c)
-	c.streamHandlers = map[int]chan Frame{}
+	c.streamHandlers = map[uint32]chan Frame{}
 	c.hpackDecoder = hpack.Decoder()
 	c.hpackEncoder = &hpack.HPackEncoder{}
-	c.outgoingFrames = make(chan Frame)
+	c.streamEvents = make(chan StreamEvent, 8)
 
 	if err := c.handleHandshake(); err != nil {
 		log.Printf("handling handshake: %s", err)
@@ -61,8 +62,19 @@ func (c *Connection) Handle() {
 	}
 
 	c.writerWG.Add(1)
-	go c.handleOutgoingFrames(ctx)
+	go c.handleStreamEvents(ctx)
 	if err := c.handleH2(); err != nil {
+		if err == ErrConnProtocolError {
+			c.writeFrame(&GoAwayFrame{
+				LastStreamID: c.maxStreamId,
+				ErrorCode:    ErrProtocolError,
+			})
+		} else if err == ErrConnStreamError {
+			c.writeFrame(&GoAwayFrame{
+				LastStreamID: c.maxStreamId,
+				ErrorCode:    ErrStreamClosed,
+			})
+		}
 		log.Printf("handling: %s", err)
 		return
 	}
@@ -149,7 +161,7 @@ func (c *Connection) handleHandshake() error {
 		Headers:    h1.H2Headers(),
 	}
 
-	c.streamHandlers[1] <- initHeaders
+	c.sendToStream(1, initHeaders)
 
 	if h1.Body != nil {
 		maxLen := int(c.settings.MaxFrameSize)
@@ -171,7 +183,7 @@ func (c *Connection) handleHandshake() error {
 				Data:      bs[:mx],
 			}
 
-			c.streamHandlers[1] <- df
+			c.sendToStream(1, df)
 
 			bs = bs[mx:]
 		}
@@ -180,20 +192,33 @@ func (c *Connection) handleHandshake() error {
 	return nil
 }
 
-func (c *Connection) handleH2() error {
+func (c *Connection) readFrame() (Frame, error) {
+	frame, err := ParseFrame(c.bufreader, c.settings.MaxFrameSize)
+	if err != nil {
+		if err == ErrExceedsMaxFrameSize {
+			c.writeFrame(&GoAwayFrame{
+				LastStreamID: c.maxStreamId,
+				ErrorCode:    ErrFrameSizeError,
+			})
+			return nil, err
+		} else if err == ErrUnknownFrame {
+			return nil, nil
+		} else {
+			return nil, err
+		}
+	}
+	return frame, nil
+}
 
+func (c *Connection) handleH2() error {
 	for {
-		frame, err := ParseFrame(c.bufreader, c.settings.MaxFrameSize)
+		frame, err := c.readFrame()
 		if err != nil {
-			if err == ErrExceedsMaxFrameSize {
-				c.outgoingFrames <- &GoAwayFrame{
-					LastStreamID: c.maxStreamId,
-					ErrorCode:    ErrFrameSizeError,
-				}
-				return err
-			} else if err != ErrUnknownFrame {
-				return err
-			}
+			return err
+		}
+
+		if frame.Header().StreamID > 0 && frame.Header().StreamID%2 == 0 {
+			return ErrConnProtocolError
 		}
 
 		switch fr := frame.(type) {
@@ -204,9 +229,38 @@ func (c *Connection) handleH2() error {
 			}
 			fr.Headers = headers
 
+			streamId := fr.Header().StreamID
+			endHeaders := fr.EndHeaders
+
+			for !endHeaders {
+				frame, err := c.readFrame()
+				if err != nil {
+					return err
+				}
+
+				continuationFrame, ok := frame.(*ContinuationFrame)
+				if !ok {
+					return ErrConnProtocolError
+				}
+
+				if streamId != continuationFrame.Header().StreamID {
+					return ErrConnProtocolError
+				}
+
+				contHeaders, err := c.hpackDecoder.Decode(continuationFrame.BlockFragment)
+				if err != nil {
+					return err
+				}
+				fr.Headers = append(fr.Headers, contHeaders...)
+
+				endHeaders = continuationFrame.EndHeaders
+			}
+
+			fr.EndHeaders = true
+
 			log.Printf("creating new stream for %d", fr.Header().StreamID)
 
-			c.newStream(int(fr.Header().StreamID))
+			c.newStream(fr.Header().StreamID)
 
 		case *SettingsFrame:
 			if !fr.Ack {
@@ -218,7 +272,7 @@ func (c *Connection) handleH2() error {
 					Ack: true,
 				}
 
-				c.outgoingFrames <- set
+				c.writeFrame(set)
 			}
 		case *PingFrame:
 			if !fr.Ack {
@@ -226,7 +280,7 @@ func (c *Connection) handleH2() error {
 
 				// TODO: handle length != 8
 
-				c.outgoingFrames <- fr
+				c.writeFrame(fr)
 			}
 		case *WindowUpdateFrame:
 			fmt.Println("HANDLE WINDOW UPDATE WHOOOPS")
@@ -235,52 +289,96 @@ func (c *Connection) handleH2() error {
 		}
 
 		if frame.Header().StreamID > 0 {
-			c.streamHandlers[int(frame.Header().StreamID)] <- frame
+			if !c.sendToStream(frame.Header().StreamID, frame) {
+				// if it's a lower streamid that's not present in the handlers, then it's closed with a STREAM_CLOSED error
+				if c.maxStreamId >= frame.Header().StreamID {
+					return ErrConnStreamError
+				} else {
+					return ErrConnProtocolError
+				}
+			}
 		}
 	}
 }
 
-func (c *Connection) handleOutgoingFrames(ctx context.Context) {
+func (c *Connection) handleStreamEvents(ctx context.Context) {
 	defer c.writerWG.Done()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case frame := <-c.outgoingFrames:
-			if frame == nil {
-				continue
-			}
-			if headerFrame, ok := frame.(*HeadersFrame); ok {
-				fmt.Printf("headers: %+v\n", headerFrame.Headers)
-				payload, _ := c.hpackEncoder.Encode(headerFrame.Headers)
-				headerFrame.BlockFragment = payload
-				frame = headerFrame
+		case event := <-c.streamEvents:
+			switch ev := event.(type) {
+			case StreamOutgoingFrameEvent:
+				frame := ev.Frame
+				if headerFrame, ok := frame.(*HeadersFrame); ok {
+					fmt.Printf("headers: %+v\n", headerFrame.Headers)
+					payload, _ := c.hpackEncoder.Encode(headerFrame.Headers)
+					headerFrame.BlockFragment = payload
+					frame = headerFrame
+				}
+
+				fmt.Printf("encoding frame: %T\n", frame)
+
+				encFrame, err := frame.Encode()
+				if err != nil {
+					log.Printf("error encoding frame: %s", err)
+				}
+
+				n, err := c.Write(encFrame)
+				if err != nil {
+					log.Printf("error writing frame: %s", err)
+				}
+				log.Printf("wrote %d bytes", n)
+			case StreamTransitionEvent:
+				if ev.ToState == StreamStateClosed {
+					c.closeStream(ev.StreamID)
+				}
 			}
 
-			fmt.Printf("encoding frame: %T\n", frame)
-
-			encFrame, err := frame.Encode()
-			if err != nil {
-				log.Printf("error encoding frame: %s", err)
-			}
-
-			n, err := c.Write(encFrame)
-			if err != nil {
-				log.Fatalf("error writing frame: %s", err)
-			}
-			log.Printf("wrote %d bytes", n)
 		}
 	}
 }
 
-func (c *Connection) newStream(streamid int) {
-	if c.maxStreamId < uint32(streamid) {
-		c.maxStreamId = uint32(streamid)
+func (c *Connection) newStream(streamid uint32) {
+	c.streamMu.Lock()
+	defer c.streamMu.Unlock()
+
+	if c.maxStreamId < streamid {
+		c.maxStreamId = streamid
+	} else {
+		return
 	}
 	if _, ok := c.streamHandlers[streamid]; ok {
 		return
 	}
-	stream := NewStream(uint32(streamid), c.outgoingFrames, c.Handler)
+	stream := NewStream(uint32(streamid), c.streamEvents, c.Handler, &c.writerWG)
 
 	c.streamHandlers[streamid] = stream
+}
+
+func (c *Connection) writeFrame(frame Frame) {
+	c.streamEvents <- StreamOutgoingFrameEvent{
+		StreamID: 0,
+		Frame:    frame,
+	}
+}
+
+func (c *Connection) sendToStream(streamid uint32, frame Frame) bool {
+	c.streamMu.Lock()
+	defer c.streamMu.Unlock()
+
+	if c.streamHandlers[streamid] != nil {
+		c.streamHandlers[streamid] <- frame
+		log.Printf("sent %T to stream %d", frame, streamid)
+		return true
+	}
+	return false
+}
+
+func (c *Connection) closeStream(streamid uint32) {
+	c.streamMu.Lock()
+	defer c.streamMu.Unlock()
+
+	delete(c.streamHandlers, streamid)
 }
